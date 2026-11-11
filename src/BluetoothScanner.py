@@ -5,10 +5,7 @@ This is an example file with correct docstring examples
 
 | Author: Sandler Wiekamp
 | Date: 2026 November 10
-"""
 
-#!/usr/bin/env python3
-"""
 ble_explorer_gui.py - Bluetooth Low Energy scanner / explorer with a GUI.
 
 Features
@@ -26,7 +23,7 @@ Requirements
                                 you may need: sudo apt install python3-tk)
 
 Run
-  python ble_explorer_gui.py
+  python BluetoothScanner.py
 
 Platform notes
   * Linux: BlueZ must be running. If scanning fails with a permissions error,
