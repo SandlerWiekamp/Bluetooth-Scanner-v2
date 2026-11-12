@@ -6,6 +6,9 @@ This is an example file with correct docstring examples
 | Author: Sandler Wiekamp
 | Date: 2026 November 10
 
+#!/usr/bin/env python3
+
+#!/usr/bin/env python3 
 ble_explorer_gui.py - Bluetooth Low Energy scanner / explorer with a GUI.
 
 Features
@@ -17,13 +20,16 @@ Features
   * Browse the device's services, then a service's characteristics
   * Read, write and subscribe to notifications/indications on characteristics
   * Disconnect
+  * Shows whether each device accepts connections (Windows/macOS) and a best
+    guess at what unnamed devices are (iPhone, AirPods, Windows PC, beacon...)
+  * Adjustable connection timeout, optional pairing, live connect countdown
 
 Requirements
   pip install bleak            (tkinter ships with Python; on Debian/Ubuntu
                                 you may need: sudo apt install python3-tk)
 
 Run
-  python BluetoothScanner.py
+  python ble_explorer_gui.py
 
 Platform notes
   * Linux: BlueZ must be running. If scanning fails with a permissions error,
@@ -133,13 +139,92 @@ def format_value(data: bytes) -> str:
     return "\n".join(lines)
 
 
+def detect_connectable(adv) -> Optional[bool]:
+    """Whether the device says it accepts connections; None if the OS doesn't tell us.
+
+    Windows and macOS report this; Linux (BlueZ) does not.
+    """
+    platform_data = getattr(adv, "platform_data", None) or ()
+    try:
+        if sys.platform == "win32" and len(platform_data) >= 2:
+            raw = platform_data[1]             # bleak RawAdvData(adv, scan)
+            args = getattr(raw, "adv", None)   # the main advertisement, not the scan response
+            if args is None:
+                return None
+            try:
+                return bool(args.is_connectable)
+            except AttributeError:             # very old Windows 10 builds
+                return int(args.advertisement_type) in (0, 1)  # CONNECTABLE_(UN)DIRECTED
+        if sys.platform == "darwin" and len(platform_data) >= 2:
+            value = platform_data[1].get("kCBAdvDataIsConnectable")
+            return None if value is None else bool(value)
+    except Exception:
+        return None
+    return None
+
+
+# Apple "Continuity" message types (first byte of Apple manufacturer data).
+APPLE_TYPES = {
+    0x02: "iBeacon",
+    0x05: "AirDrop",
+    0x07: "AirPods / Beats",
+    0x09: "AirPlay device",
+    0x0C: "iPhone / iPad / Mac (Handoff)",
+    0x10: "iPhone / iPad / Mac / Watch",
+    0x12: "Find My tag or lost device",
+}
+
+# 16-bit service UUIDs that identify common kinds of devices.
+SERVICE_HINTS = {
+    0xFE2C: "Google Fast Pair device",
+    0xFEAA: "Eddystone beacon",
+    0xFD6F: "Exposure-notification phone",
+    0x180D: "Heart-rate sensor",
+    0x1812: "Keyboard / mouse / controller",
+    0x1810: "Blood-pressure monitor",
+    0x1816: "Cycling sensor",
+    0x181A: "Environmental sensor",
+}
+
+
+def _uuid16(uuid: str) -> Optional[int]:
+    u = uuid.lower()
+    if len(u) == 36 and u.startswith("0000") and u.endswith("-0000-1000-8000-00805f9b34fb"):
+        return int(u[4:8], 16)
+    return None
+
+
+def guess_kind(adv) -> str:
+    """Best guess at what a device is, from what it advertises."""
+    mfr = adv.manufacturer_data or {}
+    apple = mfr.get(0x004C)
+    if apple:
+        return "Apple " + APPLE_TYPES.get(apple[0], "device")
+    microsoft = mfr.get(0x0006)
+    if microsoft:
+        if microsoft[0] == 0x01:
+            return "Windows PC / Xbox (Microsoft beacon)"
+        if microsoft[0] == 0x03:
+            return "Swift Pair accessory"
+        return "Microsoft device"
+    uuids = list(adv.service_uuids or []) + list((adv.service_data or {}).keys())
+    for uuid in uuids:
+        short = _uuid16(uuid)
+        if short in SERVICE_HINTS:
+            return SERVICE_HINTS[short]
+    if mfr:
+        return ", ".join(company_name(cid) for cid in mfr) + " device"
+    return "-"
+
+
 @dataclass
 class SeenDevice:
     device: Any                 # bleak BLEDevice, needed to connect
     name: Optional[str]
     rssi: int
     last_seen: float            # time.monotonic()
-    manufacturer: str = ""
+    kind: str = "-"
+    connectable: Optional[bool] = None
 
 
 class AsyncWorker:
@@ -201,6 +286,8 @@ class BLEExplorer:
         self.connecting_address: Optional[str] = None
         self.connecting_label = ""
         self.cancel_requested = False
+        self.connect_started = 0.0
+        self.connect_timeout = float(CONNECT_TIMEOUT_S)
         self.services: dict[str, Any] = {}       # tree iid -> BleakGATTService
         self.chars: dict[str, Any] = {}          # tree iid -> BleakGATTCharacteristic
         self.notifying: set[int] = set()         # characteristic handles
@@ -239,8 +326,19 @@ class BLEExplorer:
         self.disconnect_btn.pack(side="left", padx=(4, 0))
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
         self.hide_unnamed = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="Hide unnamed devices", variable=self.hide_unnamed,
+        ttk.Checkbutton(bar, text="Hide unnamed", variable=self.hide_unnamed,
                         command=self._update_device_list).pack(side="left")
+        self.hide_unconnectable = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Hide non-connectable", variable=self.hide_unconnectable,
+                        command=self._update_device_list).pack(side="left", padx=(6, 0))
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Label(bar, text="Timeout (s):").pack(side="left")
+        self.timeout_var = tk.StringVar(value=str(CONNECT_TIMEOUT_S))
+        ttk.Spinbox(bar, from_=5, to=120, increment=5, width=4,
+                    textvariable=self.timeout_var).pack(side="left", padx=(2, 6))
+        self.pair_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Pair when connecting",
+                        variable=self.pair_var).pack(side="left")
         self.status_var = tk.StringVar(value="Starting...")
         ttk.Label(bar, textvariable=self.status_var, anchor="e").pack(side="right")
 
@@ -260,12 +358,14 @@ class BLEExplorer:
         self.devices_frame = ttk.LabelFrame(main, padding=4)
         main.add(self.devices_frame, weight=3)
         self.tree = self._make_tree(self.devices_frame, [
-            ("name", "Name", 170, "w"),
-            ("address", "Address", 170, "w"),
-            ("rssi", "RSSI (dBm)", 80, "e"),
-            ("mfr", "Manufacturer", 120, "w"),
-            ("seen", "Last seen", 75, "e"),
+            ("name", "Name", 150, "w"),
+            ("address", "Address", 135, "w"),
+            ("rssi", "RSSI", 50, "e"),
+            ("conn", "Connectable", 80, "center"),
+            ("kind", "Looks like", 200, "w"),
+            ("seen", "Last seen", 65, "e"),
         ])
+        self.tree.tag_configure("unconnectable", foreground="#888888")
         self.tree.tag_configure("connected", background="#c8ecc8")
         self.tree.tag_configure("connecting", background="#fff2b3")
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_controls())
@@ -379,8 +479,10 @@ class BLEExplorer:
         self.notify_btn.configure(text="Stop notify" if notifying else "Start notify")
 
         if s == "connecting":
+            elapsed = time.monotonic() - self.connect_started
             status = ("Cancelling..." if self.cancel_requested
-                      else f"Connecting to {self.connecting_label}...")
+                      else f"Connecting to {self.connecting_label}... "
+                           f"{elapsed:.0f}/{self.connect_timeout:g} s")
         elif s == "connected":
             status = f"Connected to {self.connected_label}"
         elif s == "disconnecting":
@@ -451,7 +553,8 @@ class BLEExplorer:
     def _on_advertisement(self, device, adv) -> None:
         """Called by bleak (asyncio thread) for every advertisement received."""
         name = adv.local_name or device.name
-        mfr = ", ".join(company_name(cid) for cid in (adv.manufacturer_data or {}))
+        kind = guess_kind(adv)
+        connectable = detect_connectable(adv)
         rssi = adv.rssi if adv.rssi is not None else -127
         with self._seen_lock:
             prev = self._seen.get(device.address)
@@ -460,7 +563,9 @@ class BLEExplorer:
                 name=name or (prev.name if prev else None),
                 rssi=rssi,
                 last_seen=time.monotonic(),
-                manufacturer=mfr or (prev.manufacturer if prev else ""),
+                kind=kind if kind != "-" or prev is None else prev.kind,
+                connectable=connectable if connectable is not None or prev is None
+                else prev.connectable,
             )
 
     def _set_scanning(self, wanted: bool) -> None:
@@ -510,6 +615,9 @@ class BLEExplorer:
 
         if self.hide_unnamed.get():
             devices = [d for d in devices if d.name or d.device.address in keep]
+        if self.hide_unconnectable.get():
+            devices = [d for d in devices
+                       if d.connectable is not False or d.device.address in keep]
         devices.sort(key=lambda d: (d.rssi, d.device.address))  # weakest first
 
         wanted = {d.device.address for d in devices}
@@ -520,12 +628,15 @@ class BLEExplorer:
         for index, d in enumerate(devices):
             addr = d.device.address
             age = now - d.last_seen
-            values = (d.name or "(unknown)", addr, d.rssi, d.manufacturer or "-",
+            conn = {True: "Yes", False: "No", None: "?"}[d.connectable]
+            values = (d.name or "(no name)", addr, d.rssi, conn, d.kind,
                       "now" if age < 1 else f"{age:.0f}s ago")
             if addr == self.connected_address:
                 tags: tuple = ("connected",)
             elif addr == self.connecting_address:
                 tags = ("connecting",)
+            elif d.connectable is False:
+                tags = ("unconnectable",)
             else:
                 tags = ()
             if self.tree.exists(addr):
@@ -562,16 +673,39 @@ class BLEExplorer:
         if entry is None:
             self.log("That device is no longer in range.")
             return
+        if entry.connectable is False and not messagebox.askyesno(
+                "Device is not connectable",
+                "This device is advertising as NOT connectable (common for phones, "
+                "AirTags, earbuds in their case and beacons), so the attempt will "
+                "almost certainly time out.\n\nTry anyway?", parent=self.root):
+            return
+        try:
+            timeout = max(1.0, float(self.timeout_var.get()))
+        except ValueError:
+            timeout = float(CONNECT_TIMEOUT_S)
+            self.timeout_var.set(str(CONNECT_TIMEOUT_S))
+        pair = bool(self.pair_var.get())
 
         self.state = "connecting"
         self.cancel_requested = False
         self.connecting_address = addr
         self.connecting_label = self._device_label(addr)
-        self.log(f"Connecting to {self.connecting_label}...")
+        self.connect_started = time.monotonic()
+        self.connect_timeout = timeout
+        self.log(f"Connecting to {self.connecting_label} "
+                 f"(timeout {timeout:g} s{', pairing' if pair else ''})...")
         self._update_device_list()
-        self.run_async(self._connect(entry.device), lambda f: self._on_connect_done(f, addr))
+        self.run_async(self._connect(entry.device, timeout, pair),
+                       lambda f: self._on_connect_done(f, addr))
+        self._tick_connecting()
 
-    async def _connect(self, device) -> BleakClient:
+    def _tick_connecting(self) -> None:
+        """Refresh the countdown in the status bar while a connection is in progress."""
+        if self.state == "connecting":
+            self._update_controls()
+            self.root.after(500, self._tick_connecting)
+
+    async def _connect(self, device, timeout: float, pair: bool) -> BleakClient:
         """asyncio thread. Pauses scanning while connecting (more reliable on all OSes)."""
         self._connect_task = asyncio.current_task()
         client: Optional[BleakClient] = None
@@ -579,10 +713,14 @@ class BLEExplorer:
             if self.cancel_requested:
                 raise asyncio.CancelledError()
             await self._stop_scan()
+            kwargs: dict[str, Any] = {"timeout": timeout}
+            if pair:
+                kwargs["pair"] = True
             new_client = BleakClient(device, disconnected_callback=self._on_link_lost_async,
-                                     timeout=CONNECT_TIMEOUT_S)
+                                     **kwargs)
             client = new_client
-            await new_client.connect()
+            # Hard limit too, in case a platform ignores the timeout somewhere.
+            await asyncio.wait_for(new_client.connect(), timeout + 5)
             return new_client
         except BaseException:
             if client is not None:
@@ -626,6 +764,10 @@ class BLEExplorer:
         elif err is not None:
             self.state = "idle"
             self.log(f"Could not connect to {label}: {err}")
+            if err == "timed out":
+                self.log("  Tips: pick a device marked Connectable = Yes, move closer, make "
+                         "sure it isn't already connected to another phone/PC, or tick "
+                         "'Pair when connecting' and raise the timeout.")
         else:
             client = fut.result()
             if not client.is_connected:
